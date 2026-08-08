@@ -6,7 +6,7 @@ export
 NAME=dump1090mqtt
 BINDIR=bin
 SOURCES=$(wildcard *.go)
-BINARIES=${BINDIR}/${NAME}
+BINARIES=${BINDIR}/${NAME} ${BINDIR}/${NAME}-linux-arm64
 
 all: ${BINDIR} ${BINARIES}
 
