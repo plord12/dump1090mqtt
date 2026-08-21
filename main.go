@@ -19,13 +19,14 @@ import (
 )
 
 type Options struct {
-	AircraftFile string  `short:"a" long:"aircraftfile" description:"Path to aircraft.json" default:"/run/dump1090-fa/aircraft.json" env:"AIRCRAFTFILE"`
-	MqttBroker   string  `short:"b" long:"mqttbroker" description:"MQTT Broker URL" default:"tcp://localhost:1883" env:"MQTT_BROKER"`
-	MqttTopic    string  `short:"c" long:"mqtttopic" description:"MQTT Topic" default:"homeassistant/sensor/aircraft" env:"MQTT_TOPIC"`
-	MqttUsername string  `short:"u" long:"mqttusername" description:"MQTT username" env:"MQTT_USERNAME"`
-	MqttPassword string  `short:"p" long:"mqttpassword" description:"MQTT password" env:"MQTT_PASSWORD"`
-	HomeLat      float64 `short:"t" long:"homelat" description:"Home latitude" env:"LATITUDE"`
-	HomeLon      float64 `short:"g" long:"homelon" description:"Home longitude" env:"LONGITUDE"`
+	AircraftFile  string  `short:"a" long:"aircraftfile" description:"Path to aircraft.json" default:"/run/dump1090-fa/aircraft.json" env:"AIRCRAFTFILE"`
+	MqttBroker    string  `short:"b" long:"mqttbroker" description:"MQTT Broker URL" default:"tcp://localhost:1883" env:"MQTT_BROKER"`
+	MqttTopic     string  `short:"c" long:"mqtttopic" description:"MQTT Topic" default:"homeassistant/sensor/aircraft" env:"MQTT_TOPIC"`
+	MqttUsername  string  `short:"u" long:"mqttusername" description:"MQTT username" env:"MQTT_USERNAME"`
+	MqttPassword  string  `short:"p" long:"mqttpassword" description:"MQTT password" env:"MQTT_PASSWORD"`
+	HomeLat       float64 `short:"t" long:"homelat" description:"Home latitude" env:"LATITUDE"`
+	HomeLon       float64 `short:"g" long:"homelon" description:"Home longitude" env:"LONGITUDE"`
+	AlertDistance float64 `short:"d" long:"alertdistance" description:"Max distance to issue alert" default:"5" env:"ALERTDISTANCE"`
 }
 
 var cliOptions Options
@@ -138,6 +139,7 @@ type Aircraft struct {
 	Squawk           string
 	Emergency        string
 	Category         string
+	CategoryText     string
 	Manufacturer     string
 	Type             string
 	RegisteredOwners string
@@ -151,39 +153,19 @@ type Dump struct {
 	Aircraft []Aircraft
 }
 
-type AircraftB struct {
+type AircraftCache struct {
 	Manufacturer     string
 	Type             string
 	Registered_Owner string
 }
-type AircraftA struct {
-	Aircraft AircraftB
-}
-type AircraftCache struct {
-	Response AircraftA
-}
 
 var aircraftCache *cache.Cache[AircraftCache]
 
-type Airport struct {
-	Country_Name string
-	Municipality string
-	Name         string
-}
-
-type Airline struct {
-	Name string
-}
-type RouteB struct {
-	Airline     Airline
-	Origin      Airport
-	Destination Airport
-}
-type RouteA struct {
-	Flightroute RouteB
-}
 type RouteCache struct {
-	Response RouteA
+	OriginName         string
+	OriginCountry      string
+	DestinationName    string
+	DestinationCountry string
 }
 
 var routeCache *cache.Cache[RouteCache]
@@ -194,9 +176,38 @@ var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
 	log.Printf("Connection lost: %v", err)
+
+	/*
+		if token := client.Connect(); token.Wait() && token.Error() != nil {
+			panic(token.Error())
+		}
+	*/
 }
 
 var Directions = [17]string{"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW", "N"}
+
+var categories = map[string]string{
+	"A1": "Light",
+	"A2": "Small",
+	"A3": "Large",
+	"A4": "High vortex",
+	"A5": "Heavy",
+	"A6": "High performance",
+	"A7": "Rotorcraft",
+	"B1": "Glider",
+	"B2": "Lighter-than-air",
+	"B3": "Parachutist",
+	"B4": "Ultralight",
+	"B6": "Unmanned aerial vehicle",
+	"B7": "Space",
+	"C1": "Surface emergency vehicle",
+	"C2": "Surface vehicle",
+	"C3": "Point obstacle",
+	"C4": "Cluster obstacle",
+	"C5": "Line obstacle",
+}
+
+var client mqtt.Client
 
 func main() {
 
@@ -216,22 +227,25 @@ func main() {
 	//
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(cliOptions.MqttBroker)
-	opts.SetClientID("dump1090")
+	hostname, err := os.Hostname()
+	if err != nil {
+		opts.SetClientID("dump1090")
+	} else {
+		opts.SetClientID("dump1090-" + hostname)
+	}
 	opts.SetUsername(cliOptions.MqttUsername)
 	opts.SetPassword(cliOptions.MqttPassword)
 	opts.OnConnect = connectHandler
 	opts.OnConnectionLost = connectLostHandler
-	client := mqtt.NewClient(opts)
+	client = mqtt.NewClient(opts)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
 
-	// alert topic
-	//
-	token := client.Publish(cliOptions.MqttTopic+"/alert/config", 0, false, "{ \"name\": \"aircraft-alert\", \"icon\": \"mdi:airplane\", \"state_topic\": \""+cliOptions.MqttTopic+"/alert/state\", \"json_attributes_topic\": \""+cliOptions.MqttTopic+"/alert/attributes\", \"unique_id\": \"aircraft-alert\"}")
-	token.Wait()
-	token = client.Publish(cliOptions.MqttTopic+"/alert/state", 0, false, "{}")
-	token.Wait()
+	mqtt.ERROR = log.New(os.Stdout, "[ERROR] ", 0)
+	mqtt.CRITICAL = log.New(os.Stdout, "[CRIT] ", 0)
+	mqtt.WARN = log.New(os.Stdout, "[WARN]  ", 0)
+	//mqtt.DEBUG = log.New(os.Stdout, "[DEBUG] ", 0)
 
 	var oldAircraft = make(map[string]int)
 	var alertedAircraft = make(map[string]int)
@@ -264,15 +278,16 @@ func main() {
 		}
 		err = json.Unmarshal(data, &dump)
 		if err != nil {
-			log.Println(err)
+			log.Printf("%v - %s", err, data)
 			continue
 		}
-		log.Printf("Now: %f Messages: %d\n", dump.Now, dump.Messages)
 
 		if dump.Now <= lastNow {
 			continue
 		}
 		lastNow = dump.Now
+
+		//log.Printf("Now: %f Messages: %d\n", dump.Now, dump.Messages)
 
 		for _, aircraft := range dump.Aircraft {
 
@@ -296,58 +311,89 @@ func main() {
 				aircraft.Speed = aircraft.Gs * 1.150779
 			}
 
-			// FIX THIS - expand category
+			// expand category
 			//
+			if len(aircraft.Category) > 0 {
+				val, ok := categories[aircraft.Category]
+				if ok {
+					aircraft.CategoryText = val
+				}
+			}
 
-			// FIX THIS - watch out for sending multiple requests for data that doesn't exist
-			// aircraft
+			// Lookup aircraft
 			//
-			adsbdbAircraft := getAircraft(aircraft.Hex, distance > 0 && distance < 10)
-			if adsbdbAircraft != nil {
-				aircraft.Manufacturer = adsbdbAircraft.Response.Aircraft.Manufacturer
-				aircraft.Type = adsbdbAircraft.Response.Aircraft.Type
-				aircraft.RegisteredOwners = adsbdbAircraft.Response.Aircraft.Registered_Owner
+			aircraftCache := getAircraftHexdb(aircraft.Hex, distance >= 0)
+			if aircraftCache != nil && len(aircraft.Manufacturer) > 0 {
+				aircraft.Manufacturer = aircraftCache.Manufacturer
+				aircraft.Type = aircraftCache.Type
+				aircraft.RegisteredOwners = aircraftCache.Registered_Owner
+			} else {
+				aircraftCache = getAircraftAdsb(aircraft.Hex, distance >= 0)
+				if aircraftCache != nil {
+					aircraft.Manufacturer = aircraftCache.Manufacturer
+					aircraft.Type = aircraftCache.Type
+					aircraft.RegisteredOwners = aircraftCache.Registered_Owner
+				}
 			}
 
 			// route
 			//
 			if len(aircraft.Flight) > 0 {
-				adsbdbRoute := getRoute(aircraft.Flight, distance > 0 && distance < 10)
-				if adsbdbRoute != nil {
-					aircraft.From = adsbdbRoute.Response.Flightroute.Origin.Name + "," + adsbdbRoute.Response.Flightroute.Origin.Country_Name
-					aircraft.To = adsbdbRoute.Response.Flightroute.Destination.Name + "," + adsbdbRoute.Response.Flightroute.Destination.Country_Name
+				adsbdbRoute := getRouteHexdb(aircraft.Flight, distance >= 0)
+				if adsbdbRoute != nil && len(adsbdbRoute.OriginName) > 0 {
+					aircraft.From = adsbdbRoute.OriginName + "," + adsbdbRoute.OriginCountry
+					if adsbdbRoute != nil && len(adsbdbRoute.DestinationName) > 0 {
+						aircraft.To = adsbdbRoute.DestinationName + "," + adsbdbRoute.DestinationCountry
+					}
+				} else {
+					adsbdbRoute := getRouteAdsb(aircraft.Flight, distance >= 0)
+					if adsbdbRoute != nil && len(adsbdbRoute.OriginName) > 0 {
+						aircraft.From = adsbdbRoute.OriginName + "," + adsbdbRoute.OriginCountry
+						if adsbdbRoute != nil && len(adsbdbRoute.DestinationName) > 0 {
+							aircraft.To = adsbdbRoute.DestinationName + "," + adsbdbRoute.DestinationCountry
+						}
+					}
 				}
 			}
 
-			log.Printf("Hex: %s Flight: %s Lat: %f Long: %f Distance: %f Track: %f Gs: %f Aircraft: %s %s Owner: %s Route: %s -> %s\n", aircraft.Hex, aircraft.Flight, aircraft.Lat, aircraft.Lon, aircraft.Distance, aircraft.Track, aircraft.Gs, aircraft.Manufacturer, aircraft.Type, aircraft.RegisteredOwners, aircraft.From, aircraft.To)
+			log.Printf("Hex: %s Flight: %s Lat: %f Long: %f Distance: %f Track: %f Gs: %f Aircraft: %s %s Owner: %s Route: %s -> %s Category: %s\n", aircraft.Hex, aircraft.Flight, aircraft.Lat, aircraft.Lon, aircraft.Distance, aircraft.Track, aircraft.Gs, aircraft.Manufacturer, aircraft.Type, aircraft.RegisteredOwners, aircraft.From, aircraft.To, aircraft.Category)
 
-			// Push to mqtt
-			//
-			token := client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/config", 0, false, "{ \"name\": \"aircraft-"+aircraft.Hex+"\", \"icon\": \"mdi:airplane\", \"state_topic\": \""+cliOptions.MqttTopic+"/"+aircraft.Hex+"/state\", \"json_attributes_topic\": \""+cliOptions.MqttTopic+"/"+aircraft.Hex+"/attributes\", \"unique_id\": \"aircraft-"+aircraft.Hex+"\"}")
-			token.Wait()
-			b, err := json.Marshal(aircraft)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
+			if distance >= 0 {
+				// log.Printf("Hex: %s Flight: %s Lat: %f Long: %f Distance: %f Track: %f Gs: %f Aircraft: %s %s Owner: %s Route: %s -> %s Category: %s\n", aircraft.Hex, aircraft.Flight, aircraft.Lat, aircraft.Lon, aircraft.Distance, aircraft.Track, aircraft.Gs, aircraft.Manufacturer, aircraft.Type, aircraft.RegisteredOwners, aircraft.From, aircraft.To, aircraft.Category)
 
-			// alert if aircraft is close but not already sent an alert
-			_, alerted := alertedAircraft[aircraft.Hex]
-			if distance > 0 && distance < 5 && !alerted {
-				token = client.Publish(cliOptions.MqttTopic+"/alert/attributes", 0, false, string(b))
+				// Push to mqtt
+				//
+				token := client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/config", 0, false, "{ \"name\": \"aircraft-"+aircraft.Hex+"\", \"icon\": \"mdi:airplane\", \"state_topic\": \""+cliOptions.MqttTopic+"/"+aircraft.Hex+"/state\", \"json_attributes_topic\": \""+cliOptions.MqttTopic+"/"+aircraft.Hex+"/attributes\", \"unique_id\": \"aircraft-"+aircraft.Hex+"\"}")
 				token.Wait()
-				alertedAircraft[aircraft.Hex] = 1
-			}
-			if distance >= 5 {
-				delete(alertedAircraft, aircraft.Hex)
+				b, err := json.Marshal(aircraft)
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+				token = client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/state", 0, false, "{}")
+				token.Wait()
+				token = client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/attributes", 0, false, string(b))
+				token.Wait()
+
+				newAircraft[aircraft.Hex] = 1
+
+				// alert if aircraft is close but not already sent an alert
+				_, alerted := alertedAircraft[aircraft.Hex]
+				if distance >= 0 && distance < cliOptions.AlertDistance && !alerted {
+					log.Printf("Hex: %s Flight: %s Lat: %f Long: %f Distance: %f Track: %f Gs: %f Aircraft: %s %s Owner: %s Route: %s -> %s Category: %s\n", aircraft.Hex, aircraft.Flight, aircraft.Lat, aircraft.Lon, aircraft.Distance, aircraft.Track, aircraft.Gs, aircraft.Manufacturer, aircraft.Type, aircraft.RegisteredOwners, aircraft.From, aircraft.To, aircraft.Category)
+					token = client.Publish(cliOptions.MqttTopic+"/alert/config", 0, false, "{ \"name\": \"aircraft-alert\", \"icon\": \"mdi:airplane\", \"state_topic\": \""+cliOptions.MqttTopic+"/alert/state\", \"json_attributes_topic\": \""+cliOptions.MqttTopic+"/alert/attributes\", \"unique_id\": \"aircraft-alert\"}")
+					token.Wait()
+					token = client.Publish(cliOptions.MqttTopic+"/alert/state", 0, false, "{}")
+					token.Wait()
+					token = client.Publish(cliOptions.MqttTopic+"/alert/attributes", 0, false, string(b))
+					token.Wait()
+					alertedAircraft[aircraft.Hex] = 1
+				}
+				if distance >= 5 {
+					delete(alertedAircraft, aircraft.Hex)
+				}
 			}
 
-			token = client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/state", 0, false, "{}")
-			token.Wait()
-			token = client.Publish(cliOptions.MqttTopic+"/"+aircraft.Hex+"/attributes", 0, false, string(b))
-			token.Wait()
-
-			newAircraft[aircraft.Hex] = 1
 		}
 
 		// Remove any old flights
@@ -357,14 +403,14 @@ func main() {
 			_, ok := newAircraft[hex]
 			if !ok {
 				// found in oldAircraft but not in aircraftCache
-				log.Printf("Deleting %s since it seems to have disapeared\n", hex)
+				// log.Printf("Deleting %s since it seems to have disapeared\n", hex)
 				delete(oldAircraft, hex)
 				delete(newAircraft, hex)
-				token = client.Publish(cliOptions.MqttTopic+"/"+hex+"/config", 0, false, "{}")
+				token := client.Publish(cliOptions.MqttTopic+"/"+hex+"/config", 0, false, "{}")
 				token.Wait()
 				token = client.Publish(cliOptions.MqttTopic+"/"+hex+"/config", 0, false, "")
 				token.Wait()
-				token := client.Publish(cliOptions.MqttTopic+"/"+hex+"/state", 0, false, "")
+				token = client.Publish(cliOptions.MqttTopic+"/"+hex+"/state", 0, false, "")
 				token.Wait()
 				token = client.Publish(cliOptions.MqttTopic+"/"+hex+"/attributes", 0, false, "{}")
 				token.Wait()
@@ -400,78 +446,353 @@ func cleanup(client mqtt.Client, oldAircraft map[string]int) {
 	}
 }
 
-// Get aircraft info
-func getAircraft(hex string, fetch bool) *AircraftCache {
-	httpClient := http.Client{
-		Timeout: time.Second * 2, // Timeout after 2 seconds
-	}
-
-	adsbdbAircraft, err := aircraftCache.Get(hex)
-	if fetch && err != nil {
-		req, err := http.NewRequest(http.MethodGet, "https://api.adsbdb.com/v0/aircraft/"+hex, nil)
-		if err != nil {
-			log.Println(err)
-			return nil
-		}
-		res, err := httpClient.Do(req)
-		if err != nil {
-			log.Println(err)
-			return nil
-		}
-		if res.Body != nil {
-			defer res.Body.Close()
-		}
-		body, err := io.ReadAll(res.Body)
-		if err != nil {
-			log.Println(err)
-			return nil
-		}
-		err = json.Unmarshal(body, &adsbdbAircraft)
-		if err != nil {
-			log.Println(err)
-			return nil
-		}
-		aircraftCache.Set(*adsbdbAircraft, hex)
-	}
-
-	return adsbdbAircraft
+type AdsbdbAircraftB struct {
+	Manufacturer     string
+	Type             string
+	Registered_Owner string
+}
+type AdsbdbAircraftA struct {
+	Aircraft AdsbdbAircraftB
+}
+type AdsbdbAircraft struct {
+	Response AdsbdbAircraftA
 }
 
-// Get route info
-func getRoute(flight string, fetch bool) *RouteCache {
+// Get aircraft info from adsb
+func getAircraftAdsb(hex string, fetch bool) *AircraftCache {
 	httpClient := http.Client{
 		Timeout: time.Second * 2, // Timeout after 2 seconds
 	}
 
-	adsbdbRoute, err := routeCache.Get(flight)
+	aircraft, err := aircraftCache.Get(hex)
 	if fetch && err != nil {
-		req, err := http.NewRequest(http.MethodGet, "https://api.adsbdb.com/v0/callsign/"+flight, nil)
+		url := "https://api.adsbdb.com/v0/aircraft/" + hex
+		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Get %s failed with %v\n", url, err)
 			return nil
 		}
 		res, err := httpClient.Do(req)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Get %s failed with %v\n", url, err)
 			return nil
 		}
+
+		// not found
+		//
+		if res.StatusCode != 200 {
+
+			aircraft = new(AircraftCache)
+			aircraft.Manufacturer = ""
+			aircraft.Registered_Owner = ""
+			aircraft.Type = ""
+
+			aircraftCache.SetWithExpiration(*aircraft, time.Hour, hex)
+			return aircraft
+		}
+
 		if res.Body != nil {
 			defer res.Body.Close()
 		}
 		body, err := io.ReadAll(res.Body)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Get %s failed with %v\n", url, err)
 			return nil
 		}
-		err = json.Unmarshal(body, &adsbdbRoute)
+		var adsbdbAircraft AdsbdbAircraft
+		err = json.Unmarshal(body, &adsbdbAircraft)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
 			return nil
 		}
-		routeCache.Set(*adsbdbRoute, flight)
+
+		aircraft = new(AircraftCache)
+		aircraft.Manufacturer = adsbdbAircraft.Response.Aircraft.Manufacturer
+		aircraft.Registered_Owner = adsbdbAircraft.Response.Aircraft.Registered_Owner
+		aircraft.Type = adsbdbAircraft.Response.Aircraft.Type
+
+		//log.Printf("%s adsb worked %s %s %s\n", url, aircraft.Manufacturer, aircraft.Registered_Owner, aircraft.Type)
+
+		aircraftCache.Set(*aircraft, hex)
 	}
 
-	return adsbdbRoute
+	return aircraft
+}
+
+type HexdbAircraft struct {
+	Manufacturer     string
+	Type             string
+	RegisteredOwners string
+}
+
+// Get aircraft info from hexdb
+func getAircraftHexdb(hex string, fetch bool) *AircraftCache {
+	httpClient := http.Client{
+		Timeout: time.Second * 2, // Timeout after 2 seconds
+	}
+
+	aircraft, err := aircraftCache.Get(hex)
+	if fetch && err != nil {
+		url := "https://hexdb.io/api/v1/aircraft/" + hex
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		res, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+
+		// not found
+		if res.StatusCode != 200 {
+
+			aircraft = new(AircraftCache)
+			aircraft.Manufacturer = ""
+			aircraft.Registered_Owner = ""
+			aircraft.Type = ""
+
+			aircraftCache.SetWithExpiration(*aircraft, time.Hour, hex)
+			return aircraft
+		}
+
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		var hexdbAircraft HexdbAircraft
+		err = json.Unmarshal(body, &hexdbAircraft)
+		if err != nil {
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
+			return nil
+		}
+		aircraft = new(AircraftCache)
+		aircraft.Manufacturer = hexdbAircraft.Manufacturer
+		aircraft.Registered_Owner = hexdbAircraft.RegisteredOwners
+		aircraft.Type = hexdbAircraft.Type
+
+		//log.Printf("%s hexdb worked %s %s %s\n", url, aircraft.Manufacturer, aircraft.Registered_Owner, aircraft.Type)
+
+		aircraftCache.Set(*aircraft, hex)
+	}
+	return aircraft
+}
+
+type AdsbdbAirport struct {
+	Country_Name string
+	Municipality string
+	Name         string
+}
+
+type AdsbdbAirline struct {
+	Name string
+}
+type AdsbdbRouteB struct {
+	Origin      AdsbdbAirport
+	Destination AdsbdbAirport
+}
+type AdsbdbRouteA struct {
+	Flightroute AdsbdbRouteB
+}
+type AdsbdbRoute struct {
+	Response AdsbdbRouteA
+}
+
+// Get route info from adsb
+func getRouteAdsb(flight string, fetch bool) *RouteCache {
+	httpClient := http.Client{
+		Timeout: time.Second * 2, // Timeout after 2 seconds
+	}
+
+	route, err := routeCache.Get(flight)
+	if fetch && err != nil {
+		url := "https://api.adsbdb.com/v0/callsign/" + flight
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		res, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+
+		// not found
+		//
+		if res.StatusCode != 200 {
+
+			route = new(RouteCache)
+			route.OriginCountry = ""
+			route.OriginName = ""
+			route.DestinationCountry = ""
+			route.DestinationName = ""
+
+			routeCache.SetWithExpiration(*route, time.Hour, flight)
+			return route
+		}
+
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		var adsbdbRoute AdsbdbRoute
+		err = json.Unmarshal(body, &adsbdbRoute)
+		if err != nil {
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
+			return nil
+		}
+		route = new(RouteCache)
+		route.OriginCountry = adsbdbRoute.Response.Flightroute.Origin.Country_Name
+		route.OriginName = adsbdbRoute.Response.Flightroute.Origin.Name
+		route.DestinationCountry = adsbdbRoute.Response.Flightroute.Destination.Country_Name
+		route.DestinationName = adsbdbRoute.Response.Flightroute.Destination.Name
+
+		//log.Printf("%s adsb worked %s %s %s %s\n", url, route.OriginCountry, route.OriginName, route.DestinationCountry, route.DestinationName)
+
+		routeCache.Set(*route, flight)
+	}
+
+	return route
+}
+
+type HexdbRoute struct {
+	Route string
+}
+type HexdbAirport struct {
+	Region_Name string
+	Airport     string
+}
+
+// Get route info from hexdb
+func getRouteHexdb(flight string, fetch bool) *RouteCache {
+	httpClient := http.Client{
+		Timeout: time.Second * 2, // Timeout after 2 seconds
+	}
+
+	route, err := routeCache.Get(flight)
+	if fetch && err != nil {
+
+		url := "https://hexdb.io/api/v1/route/icao/" + flight
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		res, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		if res.StatusCode != 200 {
+			route = new(RouteCache)
+			route.OriginCountry = ""
+			route.OriginName = ""
+			route.DestinationCountry = ""
+			route.DestinationName = ""
+
+			routeCache.SetWithExpiration(*route, time.Hour, flight)
+			return route
+		}
+
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		var hexdbRoute HexdbRoute
+		err = json.Unmarshal(body, &hexdbRoute)
+		if err != nil {
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
+			return nil
+		}
+
+		routes := strings.Split(hexdbRoute.Route, "-")
+		if len(routes) != 2 {
+			route = new(RouteCache)
+			route.OriginCountry = ""
+			route.OriginName = hexdbRoute.Route
+			route.DestinationCountry = ""
+			route.DestinationName = hexdbRoute.Route
+
+			routeCache.SetWithExpiration(*route, time.Hour, flight)
+			return route
+		}
+		url = "https://hexdb.io/api/v1/airport/icao/" + routes[0]
+		req, err = http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		res, err = httpClient.Do(req)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		body, err = io.ReadAll(res.Body)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		var hexdbAirport HexdbAirport
+		err = json.Unmarshal(body, &hexdbAirport)
+		if err != nil {
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
+			return nil
+		}
+		route = new(RouteCache)
+		route.OriginCountry = hexdbAirport.Region_Name
+		route.OriginName = hexdbAirport.Airport
+		url = "https://hexdb.io/api/v1/airport/icao/" + routes[1]
+		req, err = http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		res, err = httpClient.Do(req)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		if res.Body != nil {
+			defer res.Body.Close()
+		}
+		body, err = io.ReadAll(res.Body)
+		if err != nil {
+			log.Printf("Get %s failed with %v\n", url, err)
+			return nil
+		}
+		err = json.Unmarshal(body, &hexdbAirport)
+		if err != nil {
+			log.Printf("Get %s got %d %v - %s", url, res.StatusCode, err, body)
+			return nil
+		}
+
+		route.DestinationCountry = hexdbAirport.Region_Name
+		route.DestinationName = hexdbAirport.Airport
+
+		//log.Printf("%s hexdb worked %s %s %s %s\n", url, route.OriginCountry, route.OriginName, route.DestinationCountry, route.DestinationName)
+
+		routeCache.Set(*route, flight)
+	}
+
+	return route
 }
 
 // haversin(θ) function
